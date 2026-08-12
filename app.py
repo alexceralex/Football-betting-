@@ -152,7 +152,6 @@ def fetch_sportscore_live():
     r.raise_for_status()
     data=r.json()
     matches=as_list(data,("matches","data","results"))
-    # Endpoint is live + recent, so filter locally.
     live=[m for m in matches if is_live_status(m)]
     return live
 
@@ -190,7 +189,6 @@ def odds_get(path, params):
         return None,"AUTH_OR_PLAN",r.text[:300]
 
     if r.status_code == 429:
-        # Important: 429 can be plan-blocked, not just rate-limit.
         return None,"BLOCKED_429",r.text[:300]
 
     if r.status_code >= 400:
@@ -217,7 +215,6 @@ def league_reliability(lg):
     return 0.90
 
 def timeline_features(detail):
-    # Generic event extraction; only uses fields if present.
     events=as_list(detail,("timeline","events","incidents","data"))
     cards=goals=subs=0
     recent_events=0
@@ -409,7 +406,6 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# SportScore live feed
 try:
     live=fetch_sportscore_live()
     if live:
@@ -457,7 +453,6 @@ if not udf.empty:
 short=udf.head(shortlist_n) if not udf.empty else pd.DataFrame()
 short_ids=short["ID"].tolist() if not short.empty else []
 
-# Optional detail calls: free SportScore, only shortlist
 details={}
 if load_details:
     for _,r in short.iterrows():
@@ -465,7 +460,6 @@ if load_details:
         if slug:
             details[r["ID"]]=fetch_match_detail(slug)
 
-# Our model candidates
 model_rows=[]
 match_lookup={ss_id(m):m for m in universe}
 for mid in short_ids:
@@ -481,33 +475,46 @@ for mid in short_ids:
             "Minute":ss_minute(m),
             **c
         })
+
 modeldf=pd.DataFrame(model_rows)
 
-# Plan-aware odds
 odds_state="NOT_REQUESTED"
 odds_note="Live odds disabled to protect free plan."
 betano_rows=[]
+
 if try_live_odds:
-    # First request event universe from Odds-API.
-    events_payload,state,err=odds_get("/events",{"sport":"football","status":"live","bookmaker":BOOKMAKER})
+    events_payload,state,err=odds_get(
+        "/events",
+        {"sport":"football","status":"live","bookmaker":BOOKMAKER}
+    )
     odds_state=state
+
     if state=="OK":
         oe=as_list(events_payload,("data","events","results"))
         mapped=[]
+
         for mid in short_ids:
             sm=match_lookup.get(mid)
             match,sc=map_event(sm,oe) if sm else (None,0)
             if match is not None and sc>=0.72:
                 mapped.append((mid,match,sc))
-        event_ids=[str(g(x[1],"id","eventId","event_id",default="")) for x in mapped]
+
+        event_ids=[
+            str(g(x[1],"id","eventId","event_id",default=""))
+            for x in mapped
+        ]
         event_ids=[x for x in event_ids if x][:10]
 
         if event_ids:
             payload,state2,err2=odds_get(
                 "/odds/multi",
-                {"eventIds":",".join(event_ids),"bookmakers":BOOKMAKER}
+                {
+                    "eventIds":",".join(event_ids),
+                    "bookmakers":BOOKMAKER
+                }
             )
             odds_state=state2
+
             if state2=="OK":
                 betano_rows=flatten_betano(payload)
                 odds_note=f"Live odds request succeeded. Parsed {len(betano_rows)} Betano selections."
@@ -526,59 +533,134 @@ if try_live_odds:
 st.session_state.odds_access_state=odds_state
 st.session_state.odds_last_error=odds_note
 
-# Join model to odds when available
 value=[]
 if betano_rows and not modeldf.empty:
-    # Need mapped Odds event IDs; easiest generic matching by market only is not enough across event IDs.
-    # Keep this conservative: values are shown only when event identity can be verified later.
     pass
 
-tabs=st.tabs(["🌍 LIVE","🎯 SHORTLIST","🧠 MODEL","💰 BETANO ACCESS","🧪 HEALTH"])
+tabs=st.tabs([
+    "🌍 LIVE",
+    "🎯 SHORTLIST",
+    "🧠 MODEL",
+    "💰 BETANO ACCESS",
+    "🧪 HEALTH"
+])
 
 with tabs[0]:
     c1,c2,c3=st.columns(3)
     c1.metric("Live matches",len(universe))
     c2.metric("Live source",live_source)
     c3.metric("SportScore requests",st.session_state.request_count_sportscore)
-    st.dataframe(udf,use_container_width=True,hide_index=True)
-    st.markdown('Data from [SportScore](https://sportscore.com/)')
+
+    st.dataframe(
+        udf,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.markdown(
+        'Data from [SportScore](https://sportscore.com/)'
+    )
 
 with tabs[1]:
     st.caption("Shortlistul este calculat fără cote.")
-    st.dataframe(short,use_container_width=True,hide_index=True)
+    st.dataframe(
+        short,
+        use_container_width=True,
+        hide_index=True
+    )
 
 with tabs[2]:
-    st.warning("Modelul V3.2 nu pretinde xG/SOT dacă sursa nu le oferă. Confidence rămâne LOW/MEDIUM.")
+    st.warning(
+        "Modelul V3.2 nu pretinde xG/SOT dacă sursa nu le oferă. "
+        "Confidence rămâne LOW/MEDIUM."
+    )
+
     if modeldf.empty:
         st.info("Nicio candidată model.")
     else:
         show=modeldf.copy()
         show["Model %"]=(show["P"]*100).round(1)
         show=show.drop(columns=["P"])
-        st.dataframe(show,use_container_width=True,hide_index=True)
-        qualified=show[show["Model %"]>=min_prob*100]
-        st.caption(f"{len(qualified)} evenimente model ≥ {int(min_prob*100)}%, înainte de verificarea cotei.")
+
+        st.dataframe(
+            show,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        qualified=show[
+            show["Model %"]>=min_prob*100
+        ]
+
+        st.caption(
+            f"{len(qualified)} evenimente model ≥ "
+            f"{int(min_prob*100)}%, înainte de verificarea cotei."
+        )
 
 with tabs[3]:
     st.write("Status:",odds_state)
     st.info(odds_note)
+
     if not try_live_odds:
-        st.write("Bifează «Încearcă live odds Betano» numai când vrei să testezi accesul. Nu consumăm request-uri Odds-API în mod implicit.")
+        st.write(
+            "Bifează «Încearcă live odds Betano» numai când vrei să testezi accesul. "
+            "Nu consumăm request-uri Odds-API în mod implicit."
+        )
+
     if betano_rows:
         odf=pd.DataFrame(betano_rows)
         odf=odf[odf["Odds"]>=min_odds]
-        st.dataframe(odf,use_container_width=True,hide_index=True)
-    st.caption("Pe planul free, dacă live odds sunt blocate, scannerul rămâne funcțional pe SportScore; nu afișează cote pre-match ca și cum ar fi live.")
+
+        st.dataframe(
+            odf,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.caption(
+        "Pe planul free, dacă live odds sunt blocate, "
+        "scannerul rămâne funcțional pe SportScore; "
+        "nu afișează cote pre-match ca și cum ar fi live."
+    )
 
 with tabs[4]:
-    st.write("SportScore live snapshot:",st.session_state.last_good_live_at)
-    st.write("SportScore requests this session:",st.session_state.request_count_sportscore)
-    st.write("Odds-API requests this session:",st.session_state.request_count_odds)
-    st.write("Odds access state:",st.session_state.odds_access_state)
-    st.write("Odds note:",st.session_state.odds_last_error)
-    st.success("Kill-switch separat: lipsa live odds nu mai oprește universul live.")
-    st.markdown('SportScore free API requires visible attribution: [Powered by SportScore](https://sportscore.com/).')
+    st.write(
+        "SportScore live snapshot:",
+        st.session_state.last_good_live_at
+    )
+
+    st.write(
+        "SportScore requests this session:",
+        st.session_state.request_count_sportscore
+    )
+
+    st.write(
+        "Odds-API requests this session:",
+        st.session_state.request_count_odds
+    )
+
+    st.write(
+        "Odds access state:",
+        st.session_state.odds_access_state
+    )
+
+    st.write(
+        "Odds note:",
+        st.session_state.odds_last_error
+    )
+
+    st.success(
+        "Kill-switch separat: lipsa live odds "
+        "nu mai oprește universul live."
+    )
+
+    st.markdown(
+        'SportScore free API requires visible attribution: '
+        '[Powered by SportScore](https://sportscore.com/).'
+    )
 
 st.caption(
-    "V3.2 architecture: SportScore = free live scores/universe; Odds-API = optional Betano layer. "
+    "V3.2 architecture: SportScore = free live scores/universe; "
+    "Odds-API = optional Betano layer. "
     "No live price is presented unless the live endpoint actually succeeds."
+)
