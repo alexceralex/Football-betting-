@@ -4,10 +4,12 @@ import pandas as pd
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
-st.set_page_config(page_title="Football Value Scanner V3.2", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="Football Value Scanner V3.4", page_icon="⚽", layout="wide")
 
 SPORTSCORE_MATCHES = "https://sportscore.com/api/widget/matches/"
 SPORTSCORE_MATCH = "https://sportscore.com/api/widget/match/"
+SOFASCORE_LIVE = "https://www.sofascore.com/api/v1/sport/football/events/live"
+SOFASCORE_EVENT = "https://www.sofascore.com/api/v1/event/{event_id}"
 ODDS_BASE = "https://api.odds-api.io/v3"
 BOOKMAKER = "Betano"
 
@@ -20,6 +22,7 @@ for k, v in {
     "odds_access_state": "UNKNOWN",
     "odds_last_error": "",
     "request_count_sportscore": 0,
+    "request_count_sofascore": 0,
     "request_count_odds": 0,
 }.items():
     if k not in st.session_state:
@@ -155,6 +158,21 @@ def ss_minute(m):
         except:
             pass
 
+    # SofaScore commonly exposes the current period start timestamp rather than a minute.
+    period_start=g(m,"time.currentPeriodStartTimestamp","currentPeriodStartTimestamp",default=None)
+    try:
+        if period_start is not None:
+            ps=datetime.fromtimestamp(float(period_start), tz=timezone.utc)
+            elapsed=max(0,int((now()-ps).total_seconds()//60))
+            st=_status_text(m).lower()
+            if any(x in st for x in ["2nd","second half","2nd half"]):
+                return min(130,45+elapsed)
+            if any(x in st for x in ["extra","overtime"]):
+                return min(130,90+elapsed)
+            return min(130,elapsed)
+    except Exception:
+        pass
+
     # Some feeds expose the clock as text such as 67:21 or 67'.
     for path in (
         "clock.display","clock.displayValue","statusTime.display",
@@ -179,6 +197,18 @@ def ss_slug(m):
 
 def ss_id(m):
     return str(g(m,"id","matchId","match_id","eventId","event_id",default=ss_slug(m)))
+
+def event_source(m):
+    return str(m.get("_source", "UNKNOWN")) if isinstance(m, dict) else "UNKNOWN"
+
+def mark_source(matches, source):
+    out=[]
+    for m in matches or []:
+        if isinstance(m, dict):
+            x=dict(m)
+            x["_source"]=source
+            out.append(x)
+    return out
 
 def _timestamp_utc(m):
     x=g(
@@ -243,6 +273,46 @@ def is_live_status(m):
 # -----------------------------
 # API calls
 # -----------------------------
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_sofascore_live():
+    st.session_state.request_count_sofascore += 1
+    r=requests.get(
+        SOFASCORE_LIVE,
+        headers={
+            "Accept":"application/json, text/plain, */*",
+            "User-Agent":"Mozilla/5.0 (compatible; FootballValueScanner/3.4)"
+        },
+        timeout=20
+    )
+    r.raise_for_status()
+    data=r.json()
+    events=as_list(data,("events","data","results"))
+    return mark_source(events,"SOFASCORE")
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_sofascore_detail(event_id):
+    if not event_id:
+        return {}
+    st.session_state.request_count_sofascore += 1
+    headers={
+        "Accept":"application/json, text/plain, */*",
+        "User-Agent":"Mozilla/5.0 (compatible; FootballValueScanner/3.4)"
+    }
+    detail={}
+    try:
+        r=requests.get(f"{SOFASCORE_EVENT.format(event_id=event_id)}/incidents",headers=headers,timeout=12)
+        if r.status_code==200:
+            detail.update(r.json() if isinstance(r.json(),dict) else {})
+    except Exception:
+        pass
+    try:
+        r=requests.get(f"{SOFASCORE_EVENT.format(event_id=event_id)}/statistics",headers=headers,timeout=12)
+        if r.status_code==200:
+            detail["statistics_payload"]=r.json()
+    except Exception:
+        pass
+    return detail
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_sportscore_live():
     st.session_state.request_count_sportscore += 1
@@ -254,7 +324,7 @@ def fetch_sportscore_live():
     r.raise_for_status()
     data=r.json()
     matches=as_list(data,("matches","data","results"))
-    return matches
+    return mark_source(matches,"SPORTSCORE")
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_match_detail(slug):
@@ -495,8 +565,8 @@ def odds_matches(model, odd):
 # -----------------------------
 # UI
 # -----------------------------
-st.title("⚽ Football Value Scanner V3.2")
-st.caption("SportScore live universe + plan-aware Betano odds. Live scanner no longer dies if Odds-API blocks live odds.")
+st.title("⚽ Football Value Scanner V3.4")
+st.caption("SofaScore live universe + SportScore fallback/enrichment + plan-aware Betano odds.")
 
 with st.sidebar:
     min_odds=st.number_input("Cotă minimă",1.01,10.0,1.40,0.05)
@@ -509,47 +579,57 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# SportScore live feed
-sportscore_error=""
+# Live universe: SofaScore primary, SportScore fallback
+feed_errors=[]
 raw_matches=[]
-try:
-    raw_matches=fetch_sportscore_live()
-    live=[m for m in raw_matches if is_live_status(m)]
-    if live:
-        st.session_state.last_good_live=live
-        st.session_state.last_good_live_at=now()
-except Exception as ex:
-    live=[]
-    sportscore_error=str(ex)
+live=[]
+live_source="NONE"
 
-if not live and st.session_state.last_good_live:
-    live=st.session_state.last_good_live
-    live_source="CACHED"
-else:
-    live_source="LIVE"
+try:
+    raw_matches=fetch_sofascore_live()
+    live=[m for m in raw_matches if is_live_status(m)]
+    # The endpoint is live-only in normal operation; keep returned events even if a status label changes.
+    if raw_matches and not live:
+        live=raw_matches
+    if live:
+        live_source="SOFASCORE"
+except Exception as ex:
+    feed_errors.append(f"SofaScore: {ex}")
 
 if not live:
-    st.error("SportScore a răspuns, dar scannerul nu a identificat niciun meci ca fiind LIVE.")
-    if sportscore_error:
-        st.code(f"SportScore error: {sportscore_error}")
+    try:
+        raw_ss=fetch_sportscore_live()
+        ss_live=[m for m in raw_ss if is_live_status(m)]
+        if ss_live:
+            raw_matches=raw_ss
+            live=ss_live
+            live_source="SPORTSCORE"
+    except Exception as ex:
+        feed_errors.append(f"SportScore: {ex}")
+
+if live:
+    st.session_state.last_good_live=live
+    st.session_state.last_good_live_at=now()
+elif st.session_state.last_good_live:
+    live=st.session_state.last_good_live
+    live_source="CACHED"
+
+if not live:
+    st.error("Nicio sursă nu a furnizat un univers LIVE utilizabil în acest refresh.")
+    if feed_errors:
+        st.code("\n".join(feed_errors))
     if raw_matches:
-        status_sample=[]
-        for m in raw_matches[:12]:
-            status_sample.append({
+        diag=[]
+        for m in raw_matches[:20]:
+            diag.append({
+                "Source":event_source(m),
                 "Match":ss_match_name(m),
                 "Status":ss_status(m),
                 "Minute":ss_minute(m),
                 "Score":ss_score(m),
                 "Start":str(_timestamp_utc(m) or "")
             })
-        st.warning(
-            f"API-ul a returnat {len(raw_matches)} meciuri (live + recente), "
-            "dar niciunul nu a trecut clasificatorul LIVE. Mai jos este diagnosticul real al feedului."
-        )
-        st.dataframe(pd.DataFrame(status_sample),use_container_width=True,hide_index=True)
-    else:
-        st.warning("API-ul SportScore a returnat lista de meciuri goală.")
-    st.markdown('Data from [SportScore](https://sportscore.com/)')
+        st.dataframe(pd.DataFrame(diag),use_container_width=True,hide_index=True)
     st.stop()
 
 universe=[]
@@ -565,6 +645,7 @@ rows=[]
 for m in universe:
     rows.append({
         "ID":ss_id(m),
+        "Source":event_source(m),
         "Competition":ss_league(m),
         "Match":ss_match_name(m),
         "Score":ss_score(m),
@@ -585,9 +666,19 @@ short_ids=short["ID"].tolist() if not short.empty else []
 details={}
 if load_details:
     for _,r in short.iterrows():
-        slug=r["Slug"]
-        if slug:
-            details[r["ID"]]=fetch_match_detail(slug)
+        mid=r["ID"]
+        m=match_lookup.get(mid) if "match_lookup" in locals() else None
+        # match_lookup is built immediately below in older versions; resolve directly if needed.
+        if m is None:
+            m=next((x for x in universe if ss_id(x)==mid),None)
+        if m is None:
+            continue
+        if event_source(m)=="SOFASCORE":
+            details[mid]=fetch_sofascore_detail(mid)
+        else:
+            slug=ss_slug(m)
+            if slug:
+                details[mid]=fetch_match_detail(slug)
 
 # Our model candidates
 model_rows=[]
