@@ -1,800 +1,961 @@
 import streamlit as st
-import requests, math, re, time
-import pandas as pd
+import requests
+import math
+import time
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 
-st.set_page_config(page_title="Football Value Scanner V3.4", page_icon="⚽", layout="wide")
+import pandas as pd
 
-SPORTSCORE_MATCHES = "https://sportscore.com/api/widget/matches/"
-SPORTSCORE_MATCH = "https://sportscore.com/api/widget/match/"
-SOFASCORE_LIVE = "https://www.sofascore.com/api/v1/sport/football/events/live"
-SOFASCORE_EVENT = "https://www.sofascore.com/api/v1/event/{event_id}"
+st.set_page_config(
+    page_title="Football Value Scanner V3.5",
+    page_icon="⚽",
+    layout="wide",
+)
+
 ODDS_BASE = "https://api.odds-api.io/v3"
 BOOKMAKER = "Betano"
 
-# -----------------------------
+# --------------------------------------------------
 # Session state
-# -----------------------------
-for k, v in {
+# --------------------------------------------------
+DEFAULT_STATE = {
     "last_good_live": [],
     "last_good_live_at": None,
-    "odds_access_state": "UNKNOWN",
-    "odds_last_error": "",
-    "request_count_sportscore": 0,
-    "request_count_sofascore": 0,
+    "odds_circuit_open": False,
+    "odds_circuit_reason": "",
     "request_count_odds": 0,
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+    "rate_limit_limit": None,
+    "rate_limit_remaining": None,
+    "rate_limit_reset": None,
+}
 
-# -----------------------------
-# Generic helpers
-# -----------------------------
-def odds_key():
+for key, value in DEFAULT_STATE.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# --------------------------------------------------
+# Helpers
+# --------------------------------------------------
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def api_key():
     try:
-        return st.secrets["ODDS_API_KEY"]
+        return str(st.secrets["ODDS_API_KEY"]).strip()
     except Exception:
         return ""
 
-def now():
-    return datetime.now(timezone.utc)
 
-def as_list(payload, keys=("matches","data","events","results","odds")):
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for k in keys:
-            if isinstance(payload.get(k), list):
-                return payload[k]
-    return []
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
-def g(obj, *paths, default=None):
-    for path in paths:
-        cur = obj
-        ok = True
-        for key in path.split("."):
-            if isinstance(cur, dict) and key in cur:
-                cur = cur[key]
-            else:
-                ok = False
-                break
-        if ok and cur is not None:
-            return cur
-    return default
 
-def norm(s):
-    s = str(s or "").lower()
-    s = re.sub(r"[^a-z0-9]+", "", s)
-    return s
-
-def similarity(a,b):
-    return SequenceMatcher(None, norm(a), norm(b)).ratio()
-
-def clamp(x,a,b):
-    return max(a,min(b,x))
-
-def fair_odds(p):
-    return round(1/p,2) if p and p>0 else None
-
-def implied(o):
-    return 1/o if o and o>0 else None
-
-# -----------------------------
-# SportScore parser
-# -----------------------------
-def ss_home(m):
-    x = g(m,"home.name","homeTeam.name","home","team1.name","teams.home.name",default="")
-    if isinstance(x,dict): x=x.get("name","")
-    return str(x or "")
-
-def ss_away(m):
-    x = g(m,"away.name","awayTeam.name","away","team2.name","teams.away.name",default="")
-    if isinstance(x,dict): x=x.get("name","")
-    return str(x or "")
-
-def ss_match_name(m):
-    h,a=ss_home(m),ss_away(m)
-    return f"{h} – {a}" if h or a else str(g(m,"name","title",default="Meci"))
-
-def ss_league(m):
-    x=g(m,"competition.name","league.name","competition","league","tournament.name",default="")
-    if isinstance(x,dict): x=x.get("name","")
-    return str(x or "")
-
-def ss_score_parts(m):
-    # SportScore may expose scores either as scalars or nested objects.
-    hs=g(
-        m,
-        "score.home","scores.home","score1","home_score",
-        "homeScore.current","homeScore.display","homeScore.normaltime","homeScore.period1",
-        "homeScore",
-        default=None
-    )
-    aw=g(
-        m,
-        "score.away","scores.away","score2","away_score",
-        "awayScore.current","awayScore.display","awayScore.normaltime","awayScore.period1",
-        "awayScore",
-        default=None
-    )
-    if isinstance(hs,dict):
-        hs=g(hs,"current","display","normaltime","period1",default=None)
-    if isinstance(aw,dict):
-        aw=g(aw,"current","display","normaltime","period1",default=None)
-    try: hs=int(float(hs))
-    except: hs=None
-    try: aw=int(float(aw))
-    except: aw=None
-    return hs,aw
-
-def ss_score(m):
-    h,a=ss_score_parts(m)
-    return f"{h}-{a}" if h is not None and a is not None else ""
-
-def _status_text(m):
-    vals=[]
-    for path in (
-        "status.type","status.description","status.name","status.code",
-        "state.type","state.description","state.name",
-        "phase","period","matchStatus","status"
-    ):
-        x=g(m,path,default=None)
-        if x is not None and not isinstance(x,(dict,list)):
-            vals.append(str(x))
-    return " ".join(vals).strip()
-
-def ss_minute(m):
-    for path in (
-        "minute","clock.minute","live.minute","time.minute","elapsed",
-        "statusTime.minute","matchClock.minute","timer.minute","time.current"
-    ):
-        x=g(m,path,default=None)
-        try:
-            if x is not None:
-                v=int(float(x))
-                if 0 <= v <= 130:
-                    return v
-        except:
-            pass
-
-    # SofaScore commonly exposes the current period start timestamp rather than a minute.
-    period_start=g(m,"time.currentPeriodStartTimestamp","currentPeriodStartTimestamp",default=None)
-    try:
-        if period_start is not None:
-            ps=datetime.fromtimestamp(float(period_start), tz=timezone.utc)
-            elapsed=max(0,int((now()-ps).total_seconds()//60))
-            st=_status_text(m).lower()
-            if any(x in st for x in ["2nd","second half","2nd half"]):
-                return min(130,45+elapsed)
-            if any(x in st for x in ["extra","overtime"]):
-                return min(130,90+elapsed)
-            return min(130,elapsed)
-    except Exception:
-        pass
-
-    # Some feeds expose the clock as text such as 67:21 or 67'.
-    for path in (
-        "clock.display","clock.displayValue","statusTime.display",
-        "time.display","status.description","state.description"
-    ):
-        txt=str(g(m,path,default="") or "")
-        mt=re.search(r"(?<!\d)(\d{1,3})(?=[:'’\s]|$)",txt)
-        if mt:
-            try:
-                v=int(mt.group(1))
-                if 0 <= v <= 130:
-                    return v
-            except:
-                pass
+def fair_odds(probability):
+    if probability and probability > 0:
+        return round(1.0 / probability, 2)
     return None
 
-def ss_status(m):
-    return _status_text(m)
 
-def ss_slug(m):
-    return str(g(m,"slug","matchSlug","urlSlug","event.slug",default=""))
-
-def ss_id(m):
-    return str(g(m,"id","matchId","match_id","eventId","event_id",default=ss_slug(m)))
-
-def event_source(m):
-    return str(m.get("_source", "UNKNOWN")) if isinstance(m, dict) else "UNKNOWN"
-
-def mark_source(matches, source):
-    out=[]
-    for m in matches or []:
-        if isinstance(m, dict):
-            x=dict(m)
-            x["_source"]=source
-            out.append(x)
-    return out
-
-def _timestamp_utc(m):
-    x=g(
-        m,
-        "startTimestamp","start_timestamp","startTimeTimestamp",
-        "time.startTimestamp","kickoffTimestamp","timestamp",
-        default=None
-    )
-    try:
-        x=float(x)
-        if x > 10_000_000_000:
-            x=x/1000
-        return datetime.fromtimestamp(x,tz=timezone.utc)
-    except:
+def parse_iso_datetime(value):
+    if not value:
         return None
 
-def is_live_status(m):
-    # First trust explicit boolean flags when available.
-    for path in ("live","isLive","inProgress","isInProgress"):
-        x=g(m,path,default=None)
-        if x is True or str(x).lower() == "true":
-            return True
-
-    minute=ss_minute(m)
-    if minute is not None and 0 <= minute <= 130:
-        return True
-
-    s=_status_text(m).lower().replace("_"," ").replace("-"," ")
-    compact=re.sub(r"\s+"," ",s).strip()
-
-    terminal=(
-        "finished","full time","ended","after penalties","after extra time",
-        "cancelled","canceled","postponed","abandoned","walkover","awarded"
-    )
-    scheduled=(
-        "not started","notstarted","scheduled","fixture","upcoming"
-    )
-    if any(x in compact for x in terminal):
-        return False
-    if any(x in compact for x in scheduled):
-        return False
-
-    live_tokens=(
-        "live","inprogress","in progress","1st half","first half",
-        "2nd half","second half","halftime","half time","ht",
-        "extra time","penalties","penalty shootout","break"
-    )
-    if any(x in compact for x in live_tokens):
-        return True
-
-    # Last-resort classification for feeds that omit a readable status:
-    # a scored event very close to kickoff is almost certainly active.
-    kick=_timestamp_utc(m)
-    hs,aw=ss_score_parts(m)
-    if kick is not None and hs is not None and aw is not None:
-        age=(now()-kick).total_seconds()/60
-        if -10 <= age <= 225:
-            return True
-
-    return False
-
-# -----------------------------
-# API calls
-# -----------------------------
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_sofascore_live():
-    st.session_state.request_count_sofascore += 1
-    r=requests.get(
-        SOFASCORE_LIVE,
-        headers={
-            "Accept":"application/json, text/plain, */*",
-            "User-Agent":"Mozilla/5.0 (compatible; FootballValueScanner/3.4)"
-        },
-        timeout=20
-    )
-    r.raise_for_status()
-    data=r.json()
-    events=as_list(data,("events","data","results"))
-    return mark_source(events,"SOFASCORE")
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_sofascore_detail(event_id):
-    if not event_id:
-        return {}
-    st.session_state.request_count_sofascore += 1
-    headers={
-        "Accept":"application/json, text/plain, */*",
-        "User-Agent":"Mozilla/5.0 (compatible; FootballValueScanner/3.4)"
-    }
-    detail={}
     try:
-        r=requests.get(f"{SOFASCORE_EVENT.format(event_id=event_id)}/incidents",headers=headers,timeout=12)
-        if r.status_code==200:
-            detail.update(r.json() if isinstance(r.json(),dict) else {})
+        value = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
-        pass
+        return None
+
+
+def event_id(event):
+    return str(event.get("id", ""))
+
+
+def home_name(event):
+    value = event.get("home", "")
+    if isinstance(value, dict):
+        return str(value.get("name", ""))
+    return str(value or "")
+
+
+def away_name(event):
+    value = event.get("away", "")
+    if isinstance(value, dict):
+        return str(value.get("name", ""))
+    return str(value or "")
+
+
+def league_name(event):
+    value = event.get("league", "")
+    if isinstance(value, dict):
+        return str(value.get("name", ""))
+    return str(value or "")
+
+
+def event_status(event):
+    return str(event.get("status", "") or "")
+
+
+def score_parts(event):
+    scores = event.get("scores", {})
+
+    if not isinstance(scores, dict):
+        return None, None
+
+    home = scores.get("home")
+    away = scores.get("away")
+
     try:
-        r=requests.get(f"{SOFASCORE_EVENT.format(event_id=event_id)}/statistics",headers=headers,timeout=12)
-        if r.status_code==200:
-            detail["statistics_payload"]=r.json()
+        home = int(home)
     except Exception:
-        pass
-    return detail
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_sportscore_live():
-    st.session_state.request_count_sportscore += 1
-    r=requests.get(
-        SPORTSCORE_MATCHES,
-        params={"sport":"football","limit":50,"src":"football-value-scanner"},
-        timeout=20
-    )
-    r.raise_for_status()
-    data=r.json()
-    matches=as_list(data,("matches","data","results"))
-    return mark_source(matches,"SPORTSCORE")
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_match_detail(slug):
-    if not slug:
-        return {}
-    st.session_state.request_count_sportscore += 1
-    try:
-        r=requests.get(
-            SPORTSCORE_MATCH,
-            params={"sport":"football","slug":slug,"src":"football-value-scanner"},
-            timeout=15
-        )
-        if r.status_code != 200:
-            return {}
-        return r.json()
-    except:
-        return {}
-
-def odds_get(path, params):
-    if not odds_key():
-        return None, "NO_KEY", None
-
-    st.session_state.request_count_odds += 1
-    p=dict(params)
-    p["apiKey"]=odds_key()
+        home = None
 
     try:
-        r=requests.get(f"{ODDS_BASE}{path}",params=p,timeout=20)
-    except Exception as ex:
-        return None,"NETWORK",str(ex)
+        away = int(away)
+    except Exception:
+        away = None
 
-    if r.status_code in (401,403):
-        return None,"AUTH_OR_PLAN",r.text[:300]
+    return home, away
 
-    if r.status_code == 429:
-        # Important: 429 can be plan-blocked, not just rate-limit.
-        return None,"BLOCKED_429",r.text[:300]
 
-    if r.status_code >= 400:
-        return None,f"HTTP_{r.status_code}",r.text[:300]
+def score_text(event):
+    home, away = score_parts(event)
 
-    try:
-        return r.json(),"OK",None
-    except Exception as ex:
-        return None,"PARSE",str(ex)
+    if home is None or away is None:
+        return ""
 
-# -----------------------------
-# Live model: intentionally conservative
-# -----------------------------
-def league_reliability(lg):
-    s=lg.lower()
-    if any(x in s for x in ["friendly","u19","u20","u21","reserve","youth"]):
+    return f"{home}-{away}"
+
+
+def approx_minute(event):
+    """
+    Odds-API live events expose kickoff time and status, but the documented
+    live-events response does not guarantee a match-minute field.
+    We therefore derive an APPROXIMATE minute from kickoff time.
+
+    This is intentionally labelled approximate in the UI and model.
+    """
+    kickoff = parse_iso_datetime(event.get("date"))
+
+    if kickoff is None:
+        return None
+
+    elapsed = int((now_utc() - kickoff).total_seconds() / 60)
+
+    if elapsed < 0:
+        return None
+
+    return clamp(elapsed, 1, 120)
+
+
+def league_reliability(league):
+    text = str(league or "").lower()
+
+    if any(x in text for x in [
+        "friendly", "u19", "u20", "u21", "reserve", "youth"
+    ]):
         return 0.78
-    if any(x in s for x in [
-        "champions league","europa league","conference league",
-        "premier league","serie a","la liga","bundesliga","ligue 1",
-        "superliga","eredivisie","primeira"
+
+    if any(x in text for x in [
+        "champions league",
+        "europa league",
+        "conference league",
+        "premier league",
+        "serie a",
+        "la liga",
+        "bundesliga",
+        "ligue 1",
+        "superliga",
+        "eredivisie",
+        "primeira",
     ]):
         return 1.00
+
     return 0.90
 
-def timeline_features(detail):
-    # Generic event extraction; only uses fields if present.
-    events=as_list(detail,("timeline","events","incidents","data"))
-    cards=goals=subs=0
-    recent_events=0
-    for ev in events:
-        txt=" ".join([
-            str(g(ev,"type",default="")),
-            str(g(ev,"event",default="")),
-            str(g(ev,"name",default=""))
-        ]).lower()
-        if "goal" in txt: goals+=1
-        if "card" in txt or "yellow" in txt or "red" in txt: cards+=1
-        if "sub" in txt: subs+=1
-        em=g(ev,"minute","time.minute","elapsed",default=None)
-        try:
-            if int(float(em)) >= 70:
-                recent_events+=1
-        except:
-            pass
-    return {"goals":goals,"cards":cards,"subs":subs,"recent_events":recent_events}
 
-def live_model(m, detail=None):
-    minute=ss_minute(m)
-    hs,aw=ss_score_parts(m)
-    if minute is None or hs is None or aw is None:
+def signal_score(event):
+    minute = approx_minute(event)
+    home, away = score_parts(event)
+
+    if minute is None:
+        minute = 45
+
+    if home is None or away is None:
+        home = away = 0
+
+    total = home + away
+    remaining = max(0, 95 - minute)
+
+    lam = (
+        (2.65 / 90)
+        * remaining
+        * league_reliability(league_name(event))
+    )
+
+    p_goal = 1 - math.exp(-lam)
+
+    score = p_goal
+
+    if 25 <= minute <= 72:
+        score += 0.05
+
+    if total <= 2:
+        score += 0.02
+
+    return round(score, 3)
+
+
+# --------------------------------------------------
+# Protected Odds-API request layer
+# --------------------------------------------------
+def record_rate_limit_headers(response):
+    st.session_state.rate_limit_limit = response.headers.get(
+        "x-ratelimit-limit"
+    )
+    st.session_state.rate_limit_remaining = response.headers.get(
+        "x-ratelimit-remaining"
+    )
+    st.session_state.rate_limit_reset = response.headers.get(
+        "x-ratelimit-reset"
+    )
+
+
+def protected_get(path, params=None, allow_when_circuit_open=False):
+    """
+    One guarded request.
+
+    401 / 403 / 429 open the circuit breaker for the rest of the session,
+    preventing accidental repeated requests on every Streamlit rerun.
+    """
+    if not api_key():
+        return None, "NO_KEY", "ODDS_API_KEY lipsește din Streamlit Secrets."
+
+    if st.session_state.odds_circuit_open and not allow_when_circuit_open:
+        return (
+            None,
+            "CIRCUIT_OPEN",
+            st.session_state.odds_circuit_reason,
+        )
+
+    query = dict(params or {})
+    query["apiKey"] = api_key()
+
+    try:
+        st.session_state.request_count_odds += 1
+
+        response = requests.get(
+            f"{ODDS_BASE}{path}",
+            params=query,
+            headers={"Accept": "application/json"},
+            timeout=20,
+        )
+
+        record_rate_limit_headers(response)
+
+    except requests.RequestException as exc:
+        return None, "NETWORK", str(exc)
+
+    if response.status_code in (401, 403):
+        reason = (
+            f"Odds-API HTTP {response.status_code}. "
+            "Circuit breaker activat; nu mai fac request-uri automat."
+        )
+        st.session_state.odds_circuit_open = True
+        st.session_state.odds_circuit_reason = reason
+        return None, "AUTH_OR_PLAN", reason
+
+    if response.status_code == 429:
+        reason = (
+            "Odds-API HTTP 429. Circuit breaker activat; "
+            "nu mai fac request-uri automat."
+        )
+        st.session_state.odds_circuit_open = True
+        st.session_state.odds_circuit_reason = reason
+        return None, "RATE_LIMIT_OR_PLAN", reason
+
+    if response.status_code >= 400:
+        return (
+            None,
+            f"HTTP_{response.status_code}",
+            response.text[:300],
+        )
+
+    try:
+        return response.json(), "OK", ""
+    except Exception as exc:
+        return None, "PARSE", str(exc)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_live_events():
+    """
+    Exactly one normal request for the live universe:
+    GET /events?sport=football&status=live
+
+    This endpoint/usage is documented by Odds-API.
+    """
+    payload, state, note = protected_get(
+        "/events",
+        {
+            "sport": "football",
+            "status": "live",
+        },
+    )
+
+    if state != "OK":
+        return [], state, note
+
+    if isinstance(payload, list):
+        events = payload
+    elif isinstance(payload, dict):
+        events = (
+            payload.get("data")
+            or payload.get("events")
+            or payload.get("results")
+            or []
+        )
+    else:
+        events = []
+
+    events = [
+        e for e in events
+        if isinstance(e, dict)
+        and str(e.get("status", "")).lower() == "live"
+    ]
+
+    return events, "OK", ""
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_event_odds(event_id_value):
+    """
+    Called ONLY for shortlist events and ONLY if user explicitly enables
+    Betano odds. One request per shortlisted event, cached for 90 seconds.
+    """
+    payload, state, note = protected_get(
+        "/odds",
+        {
+            "eventId": event_id_value,
+            "bookmakers": BOOKMAKER,
+        },
+    )
+
+    return payload, state, note
+
+
+# --------------------------------------------------
+# Conservative model
+# --------------------------------------------------
+def live_model(event):
+    minute = approx_minute(event)
+    home, away = score_parts(event)
+
+    if minute is None or home is None or away is None:
         return []
 
-    total=hs+aw
-    remaining=max(0,95-minute)
-    lam=(2.65/90)*remaining*league_reliability(ss_league(m))
+    total = home + away
+    remaining = max(0, 95 - minute)
 
-    diff=hs-aw
+    lam = (
+        (2.65 / 90)
+        * remaining
+        * league_reliability(league_name(event))
+    )
+
+    diff = home - away
+
     if diff != 0 and minute < 75:
-        lam*=1.10
-    if abs(diff)>=2 and minute>=60:
-        lam*=0.86
-    if minute>=75 and diff==0:
-        lam*=1.05
+        lam *= 1.10
 
-    feat=timeline_features(detail or {})
-    if feat["recent_events"]>=3:
-        lam*=1.05
+    if abs(diff) >= 2 and minute >= 60:
+        lam *= 0.86
 
-    p_goal=clamp(1-math.exp(-lam),0.02,0.98)
-    confidence="MEDIUM" if detail else "LOW"
+    if minute >= 75 and diff == 0:
+        lam *= 1.05
 
-    out=[{
-        "Market":"Goals",
-        "Selection":"Over 0.5 remaining",
-        "P":p_goal,
-        "Fair":fair_odds(p_goal),
-        "Confidence":confidence,
-        "Reason":"time remaining + score state + competition baseline"
+    p_goal = clamp(1 - math.exp(-lam), 0.02, 0.98)
+
+    output = [{
+        "Market": "Goals",
+        "Selection": "Over 0.5 remaining",
+        "P": p_goal,
+        "Fair": fair_odds(p_goal),
+        "Confidence": "LOW",
+        "Reason": "approx minute + score + league baseline",
     }]
 
-    max_new=3-total
-    if max_new>=0:
-        cdf=0.0
-        for k in range(max_new+1):
-            cdf += math.exp(-lam)*(lam**k)/math.factorial(k)
-        p_u35=clamp(cdf,0.02,0.98)
-        out.append({
-            "Market":"Totals",
-            "Selection":"Under 3.5",
-            "P":p_u35,
-            "Fair":fair_odds(p_u35),
-            "Confidence":confidence,
-            "Reason":"remaining-goals Poisson"
+    max_new = 3 - total
+
+    if max_new >= 0:
+        cdf = 0.0
+
+        for k in range(max_new + 1):
+            cdf += (
+                math.exp(-lam)
+                * (lam ** k)
+                / math.factorial(k)
+            )
+
+        p_under_35 = clamp(cdf, 0.02, 0.98)
+
+        output.append({
+            "Market": "Totals",
+            "Selection": "Under 3.5",
+            "P": p_under_35,
+            "Fair": fair_odds(p_under_35),
+            "Confidence": "LOW",
+            "Reason": "remaining-goals Poisson; approximate minute",
         })
 
-    if diff>0:
-        p=clamp(0.68+0.0045*minute+min(diff,2)*0.07,0.45,0.97)
-        out.append({
-            "Market":"Double Chance","Selection":"Home or Draw",
-            "P":p,"Fair":fair_odds(p),"Confidence":confidence,
-            "Reason":"current lead + time remaining"
+    if diff > 0:
+        probability = clamp(
+            0.68 + 0.0045 * minute + min(diff, 2) * 0.07,
+            0.45,
+            0.97,
+        )
+
+        output.append({
+            "Market": "Double Chance",
+            "Selection": "Home or Draw",
+            "P": probability,
+            "Fair": fair_odds(probability),
+            "Confidence": "LOW",
+            "Reason": "current lead + approximate minute",
         })
-    elif diff<0:
-        p=clamp(0.68+0.0045*minute+min(-diff,2)*0.07,0.45,0.97)
-        out.append({
-            "Market":"Double Chance","Selection":"Away or Draw",
-            "P":p,"Fair":fair_odds(p),"Confidence":confidence,
-            "Reason":"current lead + time remaining"
+
+    elif diff < 0:
+        probability = clamp(
+            0.68 + 0.0045 * minute + min(-diff, 2) * 0.07,
+            0.45,
+            0.97,
+        )
+
+        output.append({
+            "Market": "Double Chance",
+            "Selection": "Away or Draw",
+            "P": probability,
+            "Fair": fair_odds(probability),
+            "Confidence": "LOW",
+            "Reason": "current lead + approximate minute",
         })
 
-    return out
+    return output
 
-def signal_score(m):
-    minute=ss_minute(m) or 45
-    hs,aw=ss_score_parts(m)
-    if hs is None or aw is None:
-        hs=aw=0
-    total=hs+aw
-    rem=max(0,95-minute)
-    p_goal=1-math.exp(-(2.65/90)*rem*league_reliability(ss_league(m)))
-    score=p_goal
-    if 25<=minute<=72: score+=0.05
-    if total<=2: score+=0.02
-    return round(score,3)
 
-# -----------------------------
-# Odds event mapping
-# -----------------------------
-def odds_event_home(e):
-    x=g(e,"home","homeTeam.name","home_team",default="")
-    if isinstance(x,dict): x=x.get("name","")
-    return str(x or "")
-
-def odds_event_away(e):
-    x=g(e,"away","awayTeam.name","away_team",default="")
-    if isinstance(x,dict): x=x.get("name","")
-    return str(x or "")
-
-def map_event(ssm, odds_events):
-    h,a=ss_home(ssm),ss_away(ssm)
-    best=None
-    bestscore=0
-    for oe in odds_events:
-        oh,oa=odds_event_home(oe),odds_event_away(oe)
-        sc=(similarity(h,oh)+similarity(a,oa))/2
-        if sc>bestscore:
-            bestscore=sc
-            best=oe
-    return best,bestscore
-
+# --------------------------------------------------
+# Generic odds parser for Betano response
+# --------------------------------------------------
 def flatten_betano(payload):
-    rows=[]
-    items=as_list(payload,("data","events","results","odds"))
-    if isinstance(payload,dict) and not items:
-        items=[payload]
-    for item in items:
-        event_id=str(g(item,"eventId","event_id","id",default=""))
-        books=g(item,"bookmakers","sportsbooks",default=None)
-        if isinstance(books,dict):
-            books=[{"name":k,**(v if isinstance(v,dict) else {"markets":v})} for k,v in books.items()]
-        if not isinstance(books,list): books=[item]
-        for b in books:
-            bn=str(g(b,"name","bookmaker","sportsbook",default=""))
-            if "betano" not in bn.lower(): continue
-            markets=g(b,"markets","odds",default=[])
-            if isinstance(markets,dict):
-                markets=[{"name":k,"outcomes":v} for k,v in markets.items()]
-            if not isinstance(markets,list): continue
-            for mk in markets:
-                mn=str(g(mk,"name","key","market",default=""))
-                outs=g(mk,"outcomes","selections","prices",default=[])
-                if isinstance(outs,dict):
-                    outs=[{"name":k,"price":v} for k,v in outs.items()]
-                if not isinstance(outs,list): continue
-                for o in outs:
-                    try: price=float(g(o,"price","odds","decimal","value"))
-                    except: continue
-                    rows.append({
-                        "EventID":event_id,
-                        "MarketRaw":mn,
-                        "SelectionRaw":str(g(o,"name","label","selection",default="")),
-                        "Line":g(o,"point","line","handicap",default=""),
-                        "Odds":price
-                    })
-    return rows
+    rows = []
 
-def odds_matches(model, odd):
-    m=norm(model["Market"]+model["Selection"])
-    o=norm(odd["MarketRaw"]+odd["SelectionRaw"]+str(odd["Line"]))
-    mapping={
-        "over05remaining":["over05"],
-        "under35":["under35"],
-        "homeordraw":["1x","homeordraw","homedraw"],
-        "awayordraw":["x2","awayordraw","awaydraw"],
-    }
-    for k,pats in mapping.items():
-        if k in m:
-            return any(x in o for x in pats)
-    return False
+    if payload is None:
+        return rows
 
-# -----------------------------
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = (
+            payload.get("data")
+            or payload.get("odds")
+            or payload.get("bookmakers")
+            or [payload]
+        )
+
+        if isinstance(items, dict):
+            items = [items]
+    else:
+        return rows
+
+    def walk(obj, market_name=""):
+        if isinstance(obj, dict):
+            bookmaker = str(
+                obj.get("bookmaker")
+                or obj.get("name")
+                or ""
+            )
+
+            current_market = str(
+                obj.get("market")
+                or obj.get("key")
+                or market_name
+                or ""
+            )
+
+            price = (
+                obj.get("price")
+                or obj.get("odds")
+                or obj.get("decimal")
+            )
+
+            selection = str(
+                obj.get("selection")
+                or obj.get("label")
+                or obj.get("outcome")
+                or obj.get("name")
+                or ""
+            )
+
+            if price is not None:
+                try:
+                    price_float = float(price)
+
+                    if (
+                        "betano" in bookmaker.lower()
+                        or bookmaker == ""
+                    ):
+                        rows.append({
+                            "Market": current_market,
+                            "Selection": selection,
+                            "Odds": price_float,
+                        })
+                except Exception:
+                    pass
+
+            for key, value in obj.items():
+                if isinstance(value, (dict, list)):
+                    next_market = current_market
+
+                    if key.lower() in (
+                        "markets",
+                        "market",
+                        "outcomes",
+                        "selections",
+                    ):
+                        next_market = current_market or key
+
+                    walk(value, next_market)
+
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, market_name)
+
+    walk(items)
+
+    # Remove exact duplicates.
+    unique = []
+    seen = set()
+
+    for row in rows:
+        key = (
+            row["Market"],
+            row["Selection"],
+            row["Odds"],
+        )
+
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+
+    return unique
+
+
+# --------------------------------------------------
 # UI
-# -----------------------------
-st.title("⚽ Football Value Scanner V3.4")
-st.caption("SofaScore live universe + SportScore fallback/enrichment + plan-aware Betano odds.")
+# --------------------------------------------------
+st.title("⚽ Football Value Scanner V3.5")
+st.caption(
+    "Odds-API = live universe. Betano odds are opt-in. "
+    "Circuit breaker prevents repeated blocked requests."
+)
 
 with st.sidebar:
-    min_odds=st.number_input("Cotă minimă",1.01,10.0,1.40,0.05)
-    min_prob=st.slider("Probabilitate minimă (%)",50,90,70,1)/100
-    shortlist_n=st.slider("Shortlist",3,10,8,1)
-    exclude_friendlies=st.checkbox("Exclude amicale",True)
-    load_details=st.checkbox("Încarcă detalii SportScore pentru shortlist",True)
-    try_live_odds=st.checkbox("Încearcă live odds Betano",False)
-    if st.button("🔄 Refresh",use_container_width=True):
+    min_odds = st.number_input(
+        "Cotă minimă",
+        min_value=1.01,
+        max_value=10.0,
+        value=1.40,
+        step=0.05,
+    )
+
+    min_prob = (
+        st.slider(
+            "Probabilitate minimă (%)",
+            min_value=50,
+            max_value=90,
+            value=70,
+            step=1,
+        )
+        / 100
+    )
+
+    shortlist_n = st.slider(
+        "Shortlist",
+        min_value=3,
+        max_value=10,
+        value=8,
+        step=1,
+    )
+
+    exclude_friendlies = st.checkbox(
+        "Exclude amicale",
+        value=True,
+    )
+
+    try_betano = st.checkbox(
+        "Încarcă Betano pentru shortlist",
+        value=False,
+        help=(
+            "OFF implicit. Dacă îl activezi, aplicația face maximum "
+            "un request per meci din shortlist și îl ține în cache 90 sec."
+        ),
+    )
+
+    if st.button(
+        "🔄 Refresh live",
+        use_container_width=True,
+    ):
+        # Clear only cached data. Circuit breaker stays ON if API was blocked.
         st.cache_data.clear()
         st.rerun()
 
-# Live universe: SofaScore primary, SportScore fallback
-feed_errors=[]
-raw_matches=[]
-live=[]
-live_source="NONE"
+    if st.session_state.odds_circuit_open:
+        st.error("API circuit breaker: ON")
 
-try:
-    raw_matches=fetch_sofascore_live()
-    live=[m for m in raw_matches if is_live_status(m)]
-    # The endpoint is live-only in normal operation; keep returned events even if a status label changes.
-    if raw_matches and not live:
-        live=raw_matches
-    if live:
-        live_source="SOFASCORE"
-except Exception as ex:
-    feed_errors.append(f"SofaScore: {ex}")
+        if st.button(
+            "Reset circuit breaker",
+            use_container_width=True,
+        ):
+            st.session_state.odds_circuit_open = False
+            st.session_state.odds_circuit_reason = ""
+            st.cache_data.clear()
+            st.rerun()
 
-if not live:
-    try:
-        raw_ss=fetch_sportscore_live()
-        ss_live=[m for m in raw_ss if is_live_status(m)]
-        if ss_live:
-            raw_matches=raw_ss
-            live=ss_live
-            live_source="SPORTSCORE"
-    except Exception as ex:
-        feed_errors.append(f"SportScore: {ex}")
+
+# --------------------------------------------------
+# Live universe
+# --------------------------------------------------
+live, live_state, live_note = fetch_live_events()
 
 if live:
-    st.session_state.last_good_live=live
-    st.session_state.last_good_live_at=now()
+    st.session_state.last_good_live = live
+    st.session_state.last_good_live_at = now_utc()
+    live_source = "ODDS-API LIVE"
+
 elif st.session_state.last_good_live:
-    live=st.session_state.last_good_live
-    live_source="CACHED"
+    live = st.session_state.last_good_live
+    live_source = "LAST GOOD SNAPSHOT"
 
-if not live:
-    st.error("Nicio sursă nu a furnizat un univers LIVE utilizabil în acest refresh.")
-    if feed_errors:
-        st.code("\n".join(feed_errors))
-    if raw_matches:
-        diag=[]
-        for m in raw_matches[:20]:
-            diag.append({
-                "Source":event_source(m),
-                "Match":ss_match_name(m),
-                "Status":ss_status(m),
-                "Minute":ss_minute(m),
-                "Score":ss_score(m),
-                "Start":str(_timestamp_utc(m) or "")
-            })
-        st.dataframe(pd.DataFrame(diag),use_container_width=True,hide_index=True)
-    st.stop()
+else:
+    live_source = "NO DATA"
 
-universe=[]
-for m in live:
-    if exclude_friendlies and "friendly" in ss_league(m).lower():
+
+if live_state != "OK":
+    st.error(
+        f"Live feed: {live_state}. {live_note}"
+    )
+
+    if not live:
+        st.info(
+            "Nu mai fac alte request-uri automat. "
+            "Dacă API-ul a răspuns 401/403/429, circuit breaker-ul "
+            "rămâne activ ca să nu ardă quota."
+        )
+
+
+# --------------------------------------------------
+# Filters + table
+# --------------------------------------------------
+universe = []
+
+for event in live:
+    league = league_name(event)
+
+    if exclude_friendlies and "friendly" in league.lower():
         continue
-    mi=ss_minute(m)
-    if mi is not None and mi>88:
-        continue
-    universe.append(m)
 
-rows=[]
-for m in universe:
+    universe.append(event)
+
+
+universe = sorted(
+    universe,
+    key=signal_score,
+    reverse=True,
+)
+
+rows = []
+
+for event in universe:
     rows.append({
-        "ID":ss_id(m),
-        "Source":event_source(m),
-        "Competition":ss_league(m),
-        "Match":ss_match_name(m),
-        "Score":ss_score(m),
-        "Minute":ss_minute(m),
-        "Status":ss_status(m),
-        "Signal":signal_score(m),
-        "Slug":ss_slug(m)
+        "ID": event_id(event),
+        "Competition": league_name(event),
+        "Match": f"{home_name(event)} – {away_name(event)}",
+        "Score": score_text(event),
+        "Approx Min": approx_minute(event),
+        "Status": event_status(event),
+        "Signal": signal_score(event),
     })
 
-udf=pd.DataFrame(rows)
-if not udf.empty:
-    udf=udf.sort_values("Signal",ascending=False)
 
-short=udf.head(shortlist_n) if not udf.empty else pd.DataFrame()
-short_ids=short["ID"].tolist() if not short.empty else []
+live_df = pd.DataFrame(rows)
 
-# Optional detail calls: free SportScore, only shortlist
-details={}
-if load_details:
-    for _,r in short.iterrows():
-        mid=r["ID"]
-        m=match_lookup.get(mid) if "match_lookup" in locals() else None
-        # match_lookup is built immediately below in older versions; resolve directly if needed.
-        if m is None:
-            m=next((x for x in universe if ss_id(x)==mid),None)
-        if m is None:
-            continue
-        if event_source(m)=="SOFASCORE":
-            details[mid]=fetch_sofascore_detail(mid)
-        else:
-            slug=ss_slug(m)
-            if slug:
-                details[mid]=fetch_match_detail(slug)
+short_events = universe[:shortlist_n]
 
-# Our model candidates
-model_rows=[]
-match_lookup={ss_id(m):m for m in universe}
-for mid in short_ids:
-    m=match_lookup.get(mid)
-    if not m: continue
-    detail=details.get(mid,{})
-    for c in live_model(m,detail):
+short_rows = []
+
+for event in short_events:
+    short_rows.append({
+        "ID": event_id(event),
+        "Competition": league_name(event),
+        "Match": f"{home_name(event)} – {away_name(event)}",
+        "Score": score_text(event),
+        "Approx Min": approx_minute(event),
+        "Signal": signal_score(event),
+    })
+
+short_df = pd.DataFrame(short_rows)
+
+
+# --------------------------------------------------
+# Model
+# --------------------------------------------------
+model_rows = []
+
+for event in short_events:
+    for candidate in live_model(event):
         model_rows.append({
-            "ID":mid,
-            "Competition":ss_league(m),
-            "Match":ss_match_name(m),
-            "Score":ss_score(m),
-            "Minute":ss_minute(m),
-            **c
+            "ID": event_id(event),
+            "Competition": league_name(event),
+            "Match": f"{home_name(event)} – {away_name(event)}",
+            "Score": score_text(event),
+            "Approx Min": approx_minute(event),
+            **candidate,
         })
-modeldf=pd.DataFrame(model_rows)
 
-# Plan-aware odds
-odds_state="NOT_REQUESTED"
-odds_note="Live odds disabled to protect free plan."
-betano_rows=[]
-if try_live_odds:
-    # First request event universe from Odds-API.
-    events_payload,state,err=odds_get("/events",{"sport":"football","status":"live","bookmaker":BOOKMAKER})
-    odds_state=state
-    if state=="OK":
-        oe=as_list(events_payload,("data","events","results"))
-        mapped=[]
-        for mid in short_ids:
-            sm=match_lookup.get(mid)
-            match,sc=map_event(sm,oe) if sm else (None,0)
-            if match is not None and sc>=0.72:
-                mapped.append((mid,match,sc))
-        event_ids=[str(g(x[1],"id","eventId","event_id",default="")) for x in mapped]
-        event_ids=[x for x in event_ids if x][:10]
+model_df = pd.DataFrame(model_rows)
 
-        if event_ids:
-            payload,state2,err2=odds_get(
-                "/odds/multi",
-                {"eventIds":",".join(event_ids),"bookmakers":BOOKMAKER}
+
+# --------------------------------------------------
+# Optional Betano
+# --------------------------------------------------
+betano_frames = []
+betano_state_rows = []
+
+if try_betano and not st.session_state.odds_circuit_open:
+    for event in short_events:
+        eid = event_id(event)
+
+        if not eid:
+            continue
+
+        payload, state, note = fetch_event_odds(eid)
+
+        betano_state_rows.append({
+            "Match": f"{home_name(event)} – {away_name(event)}",
+            "State": state,
+            "Note": note,
+        })
+
+        if state != "OK":
+            # If circuit breaker opened on this request,
+            # stop immediately. Do not keep burning requests.
+            if st.session_state.odds_circuit_open:
+                break
+            continue
+
+        parsed = flatten_betano(payload)
+
+        if parsed:
+            frame = pd.DataFrame(parsed)
+            frame.insert(
+                0,
+                "Match",
+                f"{home_name(event)} – {away_name(event)}",
             )
-            odds_state=state2
-            if state2=="OK":
-                betano_rows=flatten_betano(payload)
-                odds_note=f"Live odds request succeeded. Parsed {len(betano_rows)} Betano selections."
-            else:
-                odds_note=f"Live odds endpoint unavailable: {state2}. {err2 or ''}"
-        else:
-            odds_note="Odds event mapping found no confident matches."
-    else:
-        if state=="BLOCKED_429":
-            odds_note="Odds-API blocked this live request on the current plan. This is NOT treated as hourly quota exhaustion."
-        elif state=="AUTH_OR_PLAN":
-            odds_note="Current API plan/authorization does not allow this live request."
-        else:
-            odds_note=f"Odds request failed: {state}. {err or ''}"
+            betano_frames.append(frame)
 
-st.session_state.odds_access_state=odds_state
-st.session_state.odds_last_error=odds_note
 
-# Join model to odds when available
-value=[]
-if betano_rows and not modeldf.empty:
-    # Need mapped Odds event IDs; easiest generic matching by market only is not enough across event IDs.
-    # Keep this conservative: values are shown only when event identity can be verified later.
-    pass
+if betano_frames:
+    betano_df = pd.concat(
+        betano_frames,
+        ignore_index=True,
+    )
 
-tabs=st.tabs(["🌍 LIVE","🎯 SHORTLIST","🧠 MODEL","💰 BETANO ACCESS","🧪 HEALTH"])
+    if "Odds" in betano_df.columns:
+        betano_df = betano_df[
+            betano_df["Odds"] >= min_odds
+        ]
+else:
+    betano_df = pd.DataFrame()
+
+
+# --------------------------------------------------
+# Tabs
+# --------------------------------------------------
+tabs = st.tabs([
+    "🌍 LIVE",
+    "🎯 SHORTLIST",
+    "🧠 MODEL",
+    "💰 BETANO",
+    "🧪 HEALTH",
+])
+
 
 with tabs[0]:
-    c1,c2,c3=st.columns(3)
-    c1.metric("Live matches",len(universe))
-    c2.metric("Live source",live_source)
-    c3.metric("SportScore requests",st.session_state.request_count_sportscore)
-    st.dataframe(udf,use_container_width=True,hide_index=True)
-    st.markdown('Data from [SportScore](https://sportscore.com/)')
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Live matches",
+        len(universe),
+    )
+
+    col2.metric(
+        "Live source",
+        live_source,
+    )
+
+    col3.metric(
+        "Odds-API requests",
+        st.session_state.request_count_odds,
+    )
+
+    if live_df.empty:
+        st.warning(
+            "Nu am meciuri live de afișat."
+        )
+    else:
+        st.dataframe(
+            live_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.caption(
+        "Approx Min este estimat din kickoff deoarece răspunsul "
+        "documentat pentru live events nu garantează minutul curent."
+    )
+
 
 with tabs[1]:
-    st.caption("Shortlistul este calculat fără cote.")
-    st.dataframe(short,use_container_width=True,hide_index=True)
+    if short_df.empty:
+        st.info("Shortlist gol.")
+    else:
+        st.dataframe(
+            short_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
 
 with tabs[2]:
-    st.warning("Modelul V3.2 nu pretinde xG/SOT dacă sursa nu le oferă. Confidence rămâne LOW/MEDIUM.")
-    if modeldf.empty:
-        st.info("Nicio candidată model.")
+    st.warning(
+        "Modelul este deliberat LOW confidence cât timp minutul este estimat. "
+        "Nu prezint probabilitatea ca certitudine."
+    )
+
+    if model_df.empty:
+        st.info(
+            "Nu am suficiente date pentru candidate."
+        )
     else:
-        show=modeldf.copy()
-        show["Model %"]=(show["P"]*100).round(1)
-        show=show.drop(columns=["P"])
-        st.dataframe(show,use_container_width=True,hide_index=True)
-        qualified=show[show["Model %"]>=min_prob*100]
-        st.caption(f"{len(qualified)} evenimente model ≥ {int(min_prob*100)}%, înainte de verificarea cotei.")
+        view = model_df.copy()
+        view["Model %"] = (
+            view["P"] * 100
+        ).round(1)
+
+        qualified = view[
+            view["P"] >= min_prob
+        ].copy()
+
+        view = view.drop(
+            columns=["P"],
+            errors="ignore",
+        )
+
+        st.dataframe(
+            view,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            f"{len(qualified)} candidate au model ≥ "
+            f"{int(min_prob * 100)}% înainte de filtrarea pe cotă."
+        )
+
 
 with tabs[3]:
-    st.write("Status:",odds_state)
-    st.info(odds_note)
-    if not try_live_odds:
-        st.write("Bifează «Încearcă live odds Betano» numai când vrei să testezi accesul. Nu consumăm request-uri Odds-API în mod implicit.")
-    if betano_rows:
-        odf=pd.DataFrame(betano_rows)
-        odf=odf[odf["Odds"]>=min_odds]
-        st.dataframe(odf,use_container_width=True,hide_index=True)
-    st.caption("Pe planul free, dacă live odds sunt blocate, scannerul rămâne funcțional pe SportScore; nu afișează cote pre-match ca și cum ar fi live.")
+    if not try_betano:
+        st.info(
+            "Betano este OFF implicit. "
+            "Bifează opțiunea din sidebar doar când vrei să consumi request-uri."
+        )
+
+    elif st.session_state.odds_circuit_open:
+        st.error(
+            "Circuit breaker activ. Nu mai cer cote Betano."
+        )
+
+    else:
+        if not betano_df.empty:
+            st.dataframe(
+                betano_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.warning(
+                "Nu am pars-at cote Betano pentru shortlistul curent."
+            )
+
+        if betano_state_rows:
+            st.dataframe(
+                pd.DataFrame(betano_state_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
 
 with tabs[4]:
-    st.write("SportScore live snapshot:",st.session_state.last_good_live_at)
-    st.write("SportScore requests this session:",st.session_state.request_count_sportscore)
-    st.write("Odds-API requests this session:",st.session_state.request_count_odds)
-    st.write("Odds access state:",st.session_state.odds_access_state)
-    st.write("Odds note:",st.session_state.odds_last_error)
-    st.success("Kill-switch separat: lipsa live odds nu mai oprește universul live.")
-    st.markdown('SportScore free API requires visible attribution: [Powered by SportScore](https://sportscore.com/).')
+    st.write(
+        "Last good live snapshot:",
+        st.session_state.last_good_live_at,
+    )
+
+    st.write(
+        "Odds-API requests this session:",
+        st.session_state.request_count_odds,
+    )
+
+    st.write(
+        "Circuit breaker:",
+        "ON" if st.session_state.odds_circuit_open else "OFF",
+    )
+
+    if st.session_state.odds_circuit_reason:
+        st.write(
+            "Circuit reason:",
+            st.session_state.odds_circuit_reason,
+        )
+
+    st.write(
+        "Rate limit:",
+        st.session_state.rate_limit_limit,
+    )
+
+    st.write(
+        "Rate remaining:",
+        st.session_state.rate_limit_remaining,
+    )
+
+    st.write(
+        "Rate reset:",
+        st.session_state.rate_limit_reset,
+    )
+
+    st.success(
+        "Normal live refresh = 1 request. "
+        "Betano is opt-in and stops immediately on 401/403/429."
+    )
+
 
 st.caption(
-    "V3.2 architecture: SportScore = free live scores/universe; Odds-API = optional Betano layer. "
-    "No live price is presented unless the live endpoint actually succeeds."
+    "V3.5: official Odds-API REST live universe, "
+    "60s cache, last-good snapshot, circuit breaker, "
+    "Betano opt-in."
 )
