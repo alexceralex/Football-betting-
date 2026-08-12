@@ -100,11 +100,28 @@ def ss_league(m):
     return str(x or "")
 
 def ss_score_parts(m):
-    hs=g(m,"score.home","homeScore","scores.home","score1","home_score",default=None)
-    aw=g(m,"score.away","awayScore","scores.away","score2","away_score",default=None)
-    try: hs=int(hs)
+    # SportScore may expose scores either as scalars or nested objects.
+    hs=g(
+        m,
+        "score.home","scores.home","score1","home_score",
+        "homeScore.current","homeScore.display","homeScore.normaltime","homeScore.period1",
+        "homeScore",
+        default=None
+    )
+    aw=g(
+        m,
+        "score.away","scores.away","score2","away_score",
+        "awayScore.current","awayScore.display","awayScore.normaltime","awayScore.period1",
+        "awayScore",
+        default=None
+    )
+    if isinstance(hs,dict):
+        hs=g(hs,"current","display","normaltime","period1",default=None)
+    if isinstance(aw,dict):
+        aw=g(aw,"current","display","normaltime","period1",default=None)
+    try: hs=int(float(hs))
     except: hs=None
-    try: aw=int(aw)
+    try: aw=int(float(aw))
     except: aw=None
     return hs,aw
 
@@ -112,31 +129,116 @@ def ss_score(m):
     h,a=ss_score_parts(m)
     return f"{h}-{a}" if h is not None and a is not None else ""
 
+def _status_text(m):
+    vals=[]
+    for path in (
+        "status.type","status.description","status.name","status.code",
+        "state.type","state.description","state.name",
+        "phase","period","matchStatus","status"
+    ):
+        x=g(m,path,default=None)
+        if x is not None and not isinstance(x,(dict,list)):
+            vals.append(str(x))
+    return " ".join(vals).strip()
+
 def ss_minute(m):
-    x=g(m,"minute","clock.minute","live.minute","time.minute","elapsed",default=None)
-    if x is None:
-        txt=str(g(m,"status","state","time",default=""))
-        mt=re.search(r"(\d{1,3})",txt)
+    for path in (
+        "minute","clock.minute","live.minute","time.minute","elapsed",
+        "statusTime.minute","matchClock.minute","timer.minute","time.current"
+    ):
+        x=g(m,path,default=None)
+        try:
+            if x is not None:
+                v=int(float(x))
+                if 0 <= v <= 130:
+                    return v
+        except:
+            pass
+
+    # Some feeds expose the clock as text such as 67:21 or 67'.
+    for path in (
+        "clock.display","clock.displayValue","statusTime.display",
+        "time.display","status.description","state.description"
+    ):
+        txt=str(g(m,path,default="") or "")
+        mt=re.search(r"(?<!\d)(\d{1,3})(?=[:'’\s]|$)",txt)
         if mt:
-            x=mt.group(1)
-    try: return int(float(x))
-    except: return None
+            try:
+                v=int(mt.group(1))
+                if 0 <= v <= 130:
+                    return v
+            except:
+                pass
+    return None
 
 def ss_status(m):
-    return str(g(m,"status","state","phase","time.status",default=""))
+    return _status_text(m)
 
 def ss_slug(m):
-    return str(g(m,"slug","matchSlug","urlSlug",default=""))
+    return str(g(m,"slug","matchSlug","urlSlug","event.slug",default=""))
 
 def ss_id(m):
-    return str(g(m,"id","matchId","match_id",default=ss_slug(m)))
+    return str(g(m,"id","matchId","match_id","eventId","event_id",default=ss_slug(m)))
+
+def _timestamp_utc(m):
+    x=g(
+        m,
+        "startTimestamp","start_timestamp","startTimeTimestamp",
+        "time.startTimestamp","kickoffTimestamp","timestamp",
+        default=None
+    )
+    try:
+        x=float(x)
+        if x > 10_000_000_000:
+            x=x/1000
+        return datetime.fromtimestamp(x,tz=timezone.utc)
+    except:
+        return None
 
 def is_live_status(m):
-    s=ss_status(m).lower()
+    # First trust explicit boolean flags when available.
+    for path in ("live","isLive","inProgress","isInProgress"):
+        x=g(m,path,default=None)
+        if x is True or str(x).lower() == "true":
+            return True
+
     minute=ss_minute(m)
     if minute is not None and 0 <= minute <= 130:
         return True
-    return any(x in s for x in ["live","1st","2nd","half","ht","extra","pen"])
+
+    s=_status_text(m).lower().replace("_"," ").replace("-"," ")
+    compact=re.sub(r"\s+"," ",s).strip()
+
+    terminal=(
+        "finished","full time","ended","after penalties","after extra time",
+        "cancelled","canceled","postponed","abandoned","walkover","awarded"
+    )
+    scheduled=(
+        "not started","notstarted","scheduled","fixture","upcoming"
+    )
+    if any(x in compact for x in terminal):
+        return False
+    if any(x in compact for x in scheduled):
+        return False
+
+    live_tokens=(
+        "live","inprogress","in progress","1st half","first half",
+        "2nd half","second half","halftime","half time","ht",
+        "extra time","penalties","penalty shootout","break"
+    )
+    if any(x in compact for x in live_tokens):
+        return True
+
+    # Last-resort classification for feeds that omit a readable status:
+    # a scored event very close to kickoff is almost certainly active.
+    kick=_timestamp_utc(m)
+    hs,aw=ss_score_parts(m)
+    if kick is not None and hs is not None and aw is not None:
+        age=(now()-kick).total_seconds()/60
+        if -10 <= age <= 225:
+            return True
+
+    return False
 
 # -----------------------------
 # API calls
@@ -152,8 +254,7 @@ def fetch_sportscore_live():
     r.raise_for_status()
     data=r.json()
     matches=as_list(data,("matches","data","results"))
-    live=[m for m in matches if is_live_status(m)]
-    return live
+    return matches
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_match_detail(slug):
@@ -189,6 +290,7 @@ def odds_get(path, params):
         return None,"AUTH_OR_PLAN",r.text[:300]
 
     if r.status_code == 429:
+        # Important: 429 can be plan-blocked, not just rate-limit.
         return None,"BLOCKED_429",r.text[:300]
 
     if r.status_code >= 400:
@@ -215,6 +317,7 @@ def league_reliability(lg):
     return 0.90
 
 def timeline_features(detail):
+    # Generic event extraction; only uses fields if present.
     events=as_list(detail,("timeline","events","incidents","data"))
     cards=goals=subs=0
     recent_events=0
@@ -406,13 +509,18 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+# SportScore live feed
+sportscore_error=""
+raw_matches=[]
 try:
-    live=fetch_sportscore_live()
+    raw_matches=fetch_sportscore_live()
+    live=[m for m in raw_matches if is_live_status(m)]
     if live:
         st.session_state.last_good_live=live
         st.session_state.last_good_live_at=now()
 except Exception as ex:
     live=[]
+    sportscore_error=str(ex)
 
 if not live and st.session_state.last_good_live:
     live=st.session_state.last_good_live
@@ -421,7 +529,27 @@ else:
     live_source="LIVE"
 
 if not live:
-    st.error("SportScore nu a returnat meciuri live în răspunsul curent.")
+    st.error("SportScore a răspuns, dar scannerul nu a identificat niciun meci ca fiind LIVE.")
+    if sportscore_error:
+        st.code(f"SportScore error: {sportscore_error}")
+    if raw_matches:
+        status_sample=[]
+        for m in raw_matches[:12]:
+            status_sample.append({
+                "Match":ss_match_name(m),
+                "Status":ss_status(m),
+                "Minute":ss_minute(m),
+                "Score":ss_score(m),
+                "Start":str(_timestamp_utc(m) or "")
+            })
+        st.warning(
+            f"API-ul a returnat {len(raw_matches)} meciuri (live + recente), "
+            "dar niciunul nu a trecut clasificatorul LIVE. Mai jos este diagnosticul real al feedului."
+        )
+        st.dataframe(pd.DataFrame(status_sample),use_container_width=True,hide_index=True)
+    else:
+        st.warning("API-ul SportScore a returnat lista de meciuri goală.")
+    st.markdown('Data from [SportScore](https://sportscore.com/)')
     st.stop()
 
 universe=[]
@@ -453,6 +581,7 @@ if not udf.empty:
 short=udf.head(shortlist_n) if not udf.empty else pd.DataFrame()
 short_ids=short["ID"].tolist() if not short.empty else []
 
+# Optional detail calls: free SportScore, only shortlist
 details={}
 if load_details:
     for _,r in short.iterrows():
@@ -460,6 +589,7 @@ if load_details:
         if slug:
             details[r["ID"]]=fetch_match_detail(slug)
 
+# Our model candidates
 model_rows=[]
 match_lookup={ss_id(m):m for m in universe}
 for mid in short_ids:
@@ -475,46 +605,33 @@ for mid in short_ids:
             "Minute":ss_minute(m),
             **c
         })
-
 modeldf=pd.DataFrame(model_rows)
 
+# Plan-aware odds
 odds_state="NOT_REQUESTED"
 odds_note="Live odds disabled to protect free plan."
 betano_rows=[]
-
 if try_live_odds:
-    events_payload,state,err=odds_get(
-        "/events",
-        {"sport":"football","status":"live","bookmaker":BOOKMAKER}
-    )
+    # First request event universe from Odds-API.
+    events_payload,state,err=odds_get("/events",{"sport":"football","status":"live","bookmaker":BOOKMAKER})
     odds_state=state
-
     if state=="OK":
         oe=as_list(events_payload,("data","events","results"))
         mapped=[]
-
         for mid in short_ids:
             sm=match_lookup.get(mid)
             match,sc=map_event(sm,oe) if sm else (None,0)
             if match is not None and sc>=0.72:
                 mapped.append((mid,match,sc))
-
-        event_ids=[
-            str(g(x[1],"id","eventId","event_id",default=""))
-            for x in mapped
-        ]
+        event_ids=[str(g(x[1],"id","eventId","event_id",default="")) for x in mapped]
         event_ids=[x for x in event_ids if x][:10]
 
         if event_ids:
             payload,state2,err2=odds_get(
                 "/odds/multi",
-                {
-                    "eventIds":",".join(event_ids),
-                    "bookmakers":BOOKMAKER
-                }
+                {"eventIds":",".join(event_ids),"bookmakers":BOOKMAKER}
             )
             odds_state=state2
-
             if state2=="OK":
                 betano_rows=flatten_betano(payload)
                 odds_note=f"Live odds request succeeded. Parsed {len(betano_rows)} Betano selections."
@@ -533,134 +650,60 @@ if try_live_odds:
 st.session_state.odds_access_state=odds_state
 st.session_state.odds_last_error=odds_note
 
+# Join model to odds when available
 value=[]
 if betano_rows and not modeldf.empty:
+    # Need mapped Odds event IDs; easiest generic matching by market only is not enough across event IDs.
+    # Keep this conservative: values are shown only when event identity can be verified later.
     pass
 
-tabs=st.tabs([
-    "🌍 LIVE",
-    "🎯 SHORTLIST",
-    "🧠 MODEL",
-    "💰 BETANO ACCESS",
-    "🧪 HEALTH"
-])
+tabs=st.tabs(["🌍 LIVE","🎯 SHORTLIST","🧠 MODEL","💰 BETANO ACCESS","🧪 HEALTH"])
 
 with tabs[0]:
     c1,c2,c3=st.columns(3)
     c1.metric("Live matches",len(universe))
     c2.metric("Live source",live_source)
     c3.metric("SportScore requests",st.session_state.request_count_sportscore)
-
-    st.dataframe(
-        udf,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.markdown(
-        'Data from [SportScore](https://sportscore.com/)'
-    )
+    st.dataframe(udf,use_container_width=True,hide_index=True)
+    st.markdown('Data from [SportScore](https://sportscore.com/)')
 
 with tabs[1]:
     st.caption("Shortlistul este calculat fără cote.")
-    st.dataframe(
-        short,
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(short,use_container_width=True,hide_index=True)
 
 with tabs[2]:
-    st.warning(
-        "Modelul V3.2 nu pretinde xG/SOT dacă sursa nu le oferă. "
-        "Confidence rămâne LOW/MEDIUM."
-    )
-
+    st.warning("Modelul V3.2 nu pretinde xG/SOT dacă sursa nu le oferă. Confidence rămâne LOW/MEDIUM.")
     if modeldf.empty:
         st.info("Nicio candidată model.")
     else:
         show=modeldf.copy()
         show["Model %"]=(show["P"]*100).round(1)
         show=show.drop(columns=["P"])
-
-        st.dataframe(
-            show,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        qualified=show[
-            show["Model %"]>=min_prob*100
-        ]
-
-        st.caption(
-            f"{len(qualified)} evenimente model ≥ "
-            f"{int(min_prob*100)}%, înainte de verificarea cotei."
-        )
+        st.dataframe(show,use_container_width=True,hide_index=True)
+        qualified=show[show["Model %"]>=min_prob*100]
+        st.caption(f"{len(qualified)} evenimente model ≥ {int(min_prob*100)}%, înainte de verificarea cotei.")
 
 with tabs[3]:
     st.write("Status:",odds_state)
     st.info(odds_note)
-
     if not try_live_odds:
-        st.write(
-            "Bifează «Încearcă live odds Betano» numai când vrei să testezi accesul. "
-            "Nu consumăm request-uri Odds-API în mod implicit."
-        )
-
+        st.write("Bifează «Încearcă live odds Betano» numai când vrei să testezi accesul. Nu consumăm request-uri Odds-API în mod implicit.")
     if betano_rows:
         odf=pd.DataFrame(betano_rows)
         odf=odf[odf["Odds"]>=min_odds]
-
-        st.dataframe(
-            odf,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    st.caption(
-        "Pe planul free, dacă live odds sunt blocate, "
-        "scannerul rămâne funcțional pe SportScore; "
-        "nu afișează cote pre-match ca și cum ar fi live."
-    )
+        st.dataframe(odf,use_container_width=True,hide_index=True)
+    st.caption("Pe planul free, dacă live odds sunt blocate, scannerul rămâne funcțional pe SportScore; nu afișează cote pre-match ca și cum ar fi live.")
 
 with tabs[4]:
-    st.write(
-        "SportScore live snapshot:",
-        st.session_state.last_good_live_at
-    )
-
-    st.write(
-        "SportScore requests this session:",
-        st.session_state.request_count_sportscore
-    )
-
-    st.write(
-        "Odds-API requests this session:",
-        st.session_state.request_count_odds
-    )
-
-    st.write(
-        "Odds access state:",
-        st.session_state.odds_access_state
-    )
-
-    st.write(
-        "Odds note:",
-        st.session_state.odds_last_error
-    )
-
-    st.success(
-        "Kill-switch separat: lipsa live odds "
-        "nu mai oprește universul live."
-    )
-
-    st.markdown(
-        'SportScore free API requires visible attribution: '
-        '[Powered by SportScore](https://sportscore.com/).'
-    )
+    st.write("SportScore live snapshot:",st.session_state.last_good_live_at)
+    st.write("SportScore requests this session:",st.session_state.request_count_sportscore)
+    st.write("Odds-API requests this session:",st.session_state.request_count_odds)
+    st.write("Odds access state:",st.session_state.odds_access_state)
+    st.write("Odds note:",st.session_state.odds_last_error)
+    st.success("Kill-switch separat: lipsa live odds nu mai oprește universul live.")
+    st.markdown('SportScore free API requires visible attribution: [Powered by SportScore](https://sportscore.com/).')
 
 st.caption(
-    "V3.2 architecture: SportScore = free live scores/universe; "
-    "Odds-API = optional Betano layer. "
+    "V3.2 architecture: SportScore = free live scores/universe; Odds-API = optional Betano layer. "
     "No live price is presented unless the live endpoint actually succeeds."
 )
