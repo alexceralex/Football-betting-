@@ -1,0 +1,1 @@
+streamlit>=1.42\nrequests>=2.32\npandas>=2.2\n
